@@ -109,39 +109,10 @@ def detect_and_split(video_path: Path, video_id: str, raw_dir: Path) -> list[dic
     """
     raw_dir.mkdir(parents=True, exist_ok=True)
 
-    # Step 2a: detect scenes
-    csv_path = raw_dir / "scenes.csv"
-    print(f"\n🔍 Detecting scenes for: {video_path.name}")
-    r = run(
-        [
-            SCENEDETECT, "-i", str(video_path),
-            "-o", str(raw_dir),
-            "detect-content",
-            "list-scenes", "-f", str(csv_path),
-        ],
-        timeout=300,
-    )
-    if r.returncode != 0 or not csv_path.exists():
-        raise RuntimeError("scenedetect failed")
-
-    # Step 2b: parse scenes
-    scenes = []
-    with open(csv_path) as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("Timecode List"):
-                continue
-            # format: "00:00:00.000,00:00:05.000"
-            parts = line.split(",")
-            if len(parts) != 2:
-                continue
-            start = _timecode_to_seconds(parts[0])
-            end = _timecode_to_seconds(parts[1])
-            dur = end - start
-            if dur > 0.3:  # skip extremely short scenes
-                scenes.append({"start": start, "end": end, "duration": dur})
-
-    print(f"  Found {len(scenes)} raw scenes")
+    # Step 2a: detect scenes (try multiple methods)
+    scenes = _detect_scenes(video_path, raw_dir)
+    if not scenes:
+        raise RuntimeError("No scenes detected with any method")
 
     # Step 2c: merge scenes into blocks ≤ MAX_CLIP_DURATION
     blocks = _merge_scenes(scenes)
@@ -186,6 +157,64 @@ def _timecode_to_seconds(tc: str) -> float:
     parts = tc.split(":")
     h, m, s = int(parts[0]), int(parts[1]), float(parts[2])
     return h * 3600 + m * 60 + s
+
+
+def _detect_scenes(video_path: Path, raw_dir: Path) -> list[dict]:
+    """Detect scenes using adaptive detection, fallback to timed splits."""
+    print(f"\n🔍 Detecting scenes for: {video_path.name}")
+
+    # Try: detect-adaptive (better for mixed content, music videos)
+    csv_path = raw_dir / "scenes.csv"
+    for method, extra_args in [
+        ("detect-adaptive", ["--threshold", "2.5"]),        # aggressive
+        ("detect-adaptive", []),                              # default
+        ("detect-content", ["--threshold", "15"]),            # very lenient
+    ]:
+        print(f"  Trying: {method} {' '.join(extra_args)}")
+        r = run(
+            [SCENEDETECT, "-i", str(video_path), "-o", str(raw_dir), method]
+            + extra_args
+            + ["list-scenes", "-f", str(csv_path)],
+            timeout=600,
+        )
+        if r.returncode != 0 or not csv_path.exists():
+            continue
+        scenes = _parse_scene_csv(csv_path)
+        if len(scenes) >= 3:
+            print(f"  ✓ Found {len(scenes)} raw scenes with {method}")
+            return scenes
+        print(f"  → Only {len(scenes)} scenes, trying next method...")
+
+    # Fallback: timed split every 18s (safe under 20s cap)
+    dur = get_duration(str(video_path))
+    print(f"  → Fallback: timed split every 18s (total {dur:.0f}s)")
+    scenes = []
+    t = 0.0
+    while t < dur:
+        end = min(t + 18, dur)
+        scenes.append({"start": t, "end": end, "duration": end - t})
+        t = end
+    print(f"  ✓ Created {len(scenes)} timed segments")
+    return scenes
+
+
+def _parse_scene_csv(csv_path: Path) -> list[dict]:
+    """Parse scenedetect CSV into list of {start, end, duration}."""
+    scenes = []
+    with open(csv_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("Timecode List") or line.startswith("Scene"):
+                continue
+            parts = line.split(",")
+            if len(parts) < 2:
+                continue
+            start = _timecode_to_seconds(parts[0].strip())
+            end = _timecode_to_seconds(parts[1].strip())
+            dur = end - start
+            if dur > 0.3:
+                scenes.append({"start": start, "end": end, "duration": dur})
+    return scenes
 
 
 def _merge_scenes(scenes: list[dict]) -> list[dict]:
