@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.env
+*.mp4
+*.json
+!pipeline_state.json
+output/
+work/
+raw_clips/
+.DS_Store
